@@ -418,31 +418,91 @@ sub _diag_exp_warning {
 }
 
 package Test::Warn::Categorization;
-
-use Carp;
-
+use Config;
 my $bits = \%warnings::Bits;
-my @warnings = sort grep {
-  my $warn_bits = $bits->{$_};
-  !grep { $_ ne $warn_bits && ($_ & $warn_bits) eq $_ } values %$bits;
-} keys %$bits;
-
-sub _warning_category_regexp {
-    my $category = shift;
-    my $category_bits = $bits->{$category} or return;
-    my @category_warnings
-      = grep { ($bits->{$_} & $category_bits) eq $bits->{$_} } @warnings;
-
-    my $re = join "|", @category_warnings;
-    return qr/$re/;
+my @warnings;
+{
+    my $perldiag = "$Config{privlibexp}/pods/perldiag.pod";
+    open my $fh, '<', $perldiag or die "can't open $perldiag: $!";
+    my $content = do { local $/; <$fh> };
+    close $fh;
+    $content =~ s/\r\n?/\n/g;
+    my @headers;
+    while (length $content) {
+        my $directive = $content =~ s/\A(=(?:[^\n]+\n)+)// ? $1 : '';
+        if ( $directive =~ /^=begin\b/ ) {
+            $content =~ s/.*?^=end\b[^\n]*\n//ms
+        }
+        elsif ( $directive =~ /^=item (.*)/s) {
+            my $header = $1;
+            if ($header =~ /^perl: /) {
+                # interpreter error, not lexical error
+                next;
+            }
+            $header =~ s/[A-Z]<(.*?)>/$1/g;
+            $header =~ s/(\.\s*)?$//;
+            my @parts = split /(%l?[dxX]|%[ucp]|%(?:\.\d+)?[fs])/, $header;
+            my $match = join '', map {
+                if( /^%c$/ ){
+                    '.';
+                }
+                elsif ( /^%(?:d|u)$/ ) {
+                    '\d+';
+                }
+                elsif ( /^%(?:s|.*f)$/ ) {
+                    '.*';
+                }
+                elsif ( /^%.(\d+)s/ ) {
+                    ".{$1}";
+                }
+                elsif ( /^%l*([pxX])$/ ) {
+                    $1 eq 'X' ? '[\dA-F]+' : '[\da-f]+';
+                }
+                elsif ( length ) {
+                    quotemeta;
+                }
+            } @parts;
+            $match =~ s/\.\*\z/.*?/;
+            $match =~ s/(?:\\\s)+/\\s+/g;
+            push @headers, qr/$match/;
+        }
+        elsif ( $directive ) {
+            @headers = ();
+        }
+        elsif ( $content =~ s/\A(.*?)(^=|\z)/$2/ms) {
+            my $text = $1;
+            if (@headers && $text =~ /^\(([WDS])(?:\s+([^\)]+))?\)/ms) {
+                my $type = $1;
+                my $categories = $2 || (
+                      $type eq 'D' ? 'deprecated'
+                    : $type eq 'S' ? 'severe'
+                                   : undef
+                );
+                if ($categories) {
+                    my @categories = split /,/, $categories;
+                    s/^\s+//,s/\s+$// for @categories;
+                    my @strict_cats = grep {
+                        my $cat = $_;
+                        !grep {
+                            $_ ne $cat && 
+                            ($bits->{$_} & $bits->{$cat}) eq $bits->{$_};
+                        } @categories;
+                    } @categories;
+                    push @warnings, map [ $_, @strict_cats ], @headers;
+                }
+            }
+            @headers = ();
+        }
+    }
 }
 
 sub warning_like_category {
     my ($warning, $category) = @_;
-    my $re = _warning_category_regexp($category) or 
-        carp("Unknown warning category '$category'"),return;
-    my $ok = $warning =~ /$re/;
+    return unless $warning;
+    my $category_bits = $bits->{$category} or return;
+    my @warning_categories = map { @{$_}[1 .. $#$_] } grep { $warning =~ $_->[0] } @warnings;
+    my $ok = !!grep { ($bits->{$_} & $category_bits) eq $bits->{$_} } @warning_categories;
     return $ok;
 }
- 
+
 1;
